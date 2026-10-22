@@ -1,6 +1,6 @@
 #include "EpdDisplay.h"
 
-#include "StockRenderConfig.h"
+#include "../../StockRenderConfig.h"
 #include <SPI.h>
 #include <limits.h>
 

@@ -1,41 +1,24 @@
-#include "EpdDisplay.h"
 #include "StockRenderConfig.h"
-#include "StockRenderer.h"
+#include "src/display/EpdDisplay.h"
+#include "src/marketdata/FixedStockPriceClient.h"
+#include "src/render/StockRenderer.h"
 
 using namespace stockrender;
+using namespace stockdata;
 
 static EpdDisplay display;
+static FixedStockPriceClient stockPriceClient;
 static const uint8_t TRADING_DAY_POINTS = 27;
-static const uint8_t TSLA_NOON_POINTS = 10;
+static const char *const STOCK_SYMBOLS[] = {"AAPL", "MSFT", "GOOG", "TSLA"};
+static const uint8_t STOCK_COUNT =
+    sizeof(STOCK_SYMBOLS) / sizeof(STOCK_SYMBOLS[0]);
 
-// Oct 19, 2026 15-minute closes, normalized with the Oct 16 close to 0-100.
-static const uint8_t AAPL_SPARK[] = {
-    70, 84, 100, 99, 80, 67, 43, 43, 31, 12, 0, 19, 16, 8,
-    12, 20, 31, 37, 57, 56, 45, 47, 43, 41, 31, 39, 39};
-static const uint8_t MSFT_SPARK[] = {
-    45, 42, 86, 83, 82, 98, 93, 98, 100, 92, 86, 72, 79, 73,
-    75, 75, 83, 83, 84, 82, 88, 88, 91, 87, 90, 77, 76};
-static const uint8_t GOOG_SPARK[] = {
-    55, 60, 96, 91, 82, 95, 100, 94, 93, 96, 89, 90, 87, 74,
-    66, 68, 72, 64, 66, 66, 68, 76, 88, 94, 92, 66, 66};
-// Simulated noon update: first 10 completed bars; remaining slots are unused.
-static const uint8_t TSLA_SPARK[TRADING_DAY_POINTS] = {
-    41, 53, 69, 81, 83, 87, 91, 98, 98, 100};
-
-// Oct 19, 2026 close; daily change is versus the Oct 16 close.
-static const Stock STOCKS[] = {
-    {"AAPL", "$342.94", "-0.15%", true, 53, AAPL_SPARK, TRADING_DAY_POINTS,
-     TRADING_DAY_POINTS},
-    {"MSFT", "$533.52", "+0.84%", false, 0, MSFT_SPARK, TRADING_DAY_POINTS,
-     TRADING_DAY_POINTS},
-    {"GOOG", "$340.16", "+0.96%", false, 0, GOOG_SPARK, TRADING_DAY_POINTS,
-     TRADING_DAY_POINTS},
-    {"TSLA", "$368.34", "+3.84%", false, 0, TSLA_SPARK, TSLA_NOON_POINTS,
-     TRADING_DAY_POINTS}};
-
+static Stock ACTIVE_STOCKS[STOCK_COUNT];
+static uint8_t ACTIVE_SPARKLINES[STOCK_COUNT][TRADING_DAY_POINTS];
+static char ACTIVE_PRICES[STOCK_COUNT][16];
+static char ACTIVE_CHANGES[STOCK_COUNT][16];
 static const Layout DASHBOARD_LAYOUT = {2, 2, 2, 62};
-static const PixelSource RENDERER(STOCKS, sizeof(STOCKS) / sizeof(STOCKS[0]),
-                                  DASHBOARD_LAYOUT);
+static const PixelSource RENDERER(ACTIVE_STOCKS, STOCK_COUNT, DASHBOARD_LAYOUT);
 
 #if STOCK_RENDER_USE_FRAMEBUFFER
 static uint8_t blackPlane[PLANE_BYTES];
@@ -48,6 +31,90 @@ static void writeStreamByte(Plane plane, uint8_t value) {
 }
 
 static void refreshDisplay() { display.refresh(); }
+
+static bool applyQuote(uint8_t index, const StockQuote &quote) {
+  if (quote.intradayCount < 2 || quote.intradayCount > TRADING_DAY_POINTS ||
+      quote.previousClose <= 0.0f)
+    return false;
+
+  float minimum = quote.previousClose;
+  float maximum = quote.previousClose;
+  for (uint8_t i = 0; i < quote.intradayCount; ++i) {
+    if (quote.intradayPrices[i] < minimum)
+      minimum = quote.intradayPrices[i];
+    if (quote.intradayPrices[i] > maximum)
+      maximum = quote.intradayPrices[i];
+  }
+
+  float span = maximum - minimum;
+  for (uint8_t i = 0; i < quote.intradayCount; ++i) {
+    float normalized =
+        span == 0.0f ? 50.0f
+                     : (quote.intradayPrices[i] - minimum) * 100.0f / span;
+    ACTIVE_SPARKLINES[index][i] = (uint8_t)(normalized + 0.5f);
+  }
+
+  float previousCloseLevel =
+      span == 0.0f ? 50.0f : (quote.previousClose - minimum) * 100.0f / span;
+  float changePercent =
+      (quote.price - quote.previousClose) * 100.0f / quote.previousClose;
+
+  String priceText = "$";
+  priceText += String(quote.price, 2);
+  priceText.toCharArray(ACTIVE_PRICES[index], sizeof(ACTIVE_PRICES[index]));
+
+  String changeText = changePercent < 0.0f ? "-" : "+";
+  changeText +=
+      String(changePercent < 0.0f ? -changePercent : changePercent, 2);
+  changeText += '%';
+  changeText.toCharArray(ACTIVE_CHANGES[index], sizeof(ACTIVE_CHANGES[index]));
+
+  ACTIVE_STOCKS[index].price = ACTIVE_PRICES[index];
+  ACTIVE_STOCKS[index].change = ACTIVE_CHANGES[index];
+  ACTIVE_STOCKS[index].changeIsRed = changePercent < 0.0f;
+  ACTIVE_STOCKS[index].previousCloseLevel =
+      (uint8_t)(previousCloseLevel + 0.5f);
+  ACTIVE_STOCKS[index].sparkline = ACTIVE_SPARKLINES[index];
+  ACTIVE_STOCKS[index].sparklineCount = quote.intradayCount;
+  ACTIVE_STOCKS[index].sparklineCapacity = TRADING_DAY_POINTS;
+  return true;
+}
+
+static void fetchStockQuotes() {
+  for (uint8_t i = 0; i < STOCK_COUNT; ++i)
+    ACTIVE_STOCKS[i] = {STOCK_SYMBOLS[i],  NULL, NULL, false, 50, NULL, 0,
+                        TRADING_DAY_POINTS};
+
+  for (uint8_t i = 0; i < STOCK_COUNT; ++i) {
+    StockQuote quote = {};
+    bool fetched = stockPriceClient.fetch(STOCK_SYMBOLS[i], quote);
+    if (!fetched) {
+      Serial.print(F("Fetch/parse failed for "));
+      Serial.print(STOCK_SYMBOLS[i]);
+      Serial.print(F(": "));
+      Serial.println(F("no demo fixture available"));
+      continue;
+    }
+
+    if (applyQuote(i, quote)) {
+      Serial.print(F("Loaded quote for "));
+      Serial.println(STOCK_SYMBOLS[i]);
+      Serial.print(F(" price="));
+      Serial.print(quote.price, 2);
+      Serial.print(F(" samples="));
+      Serial.println(quote.intradayCount);
+    } else {
+      Serial.print(F("Quote rejected for "));
+      Serial.print(STOCK_SYMBOLS[i]);
+      Serial.print(F("; price="));
+      Serial.print(quote.price, 2);
+      Serial.print(F(" previousClose="));
+      Serial.print(quote.previousClose, 2);
+      Serial.print(F(" samples="));
+      Serial.println(quote.intradayCount);
+    }
+  }
+}
 
 static void drawDashboard() {
 #if STOCK_RENDER_USE_FRAMEBUFFER
@@ -67,7 +134,8 @@ static void drawDashboard() {
 
 void setup() {
   Serial.begin(STOCK_RENDER_SERIAL_BAUD);
-  Serial.println(F("Oct 19, 2026 15-minute chart; TSLA simulates noon"));
+  Serial.println(F("Fetching stock data"));
+  fetchStockQuotes();
 
   if (display.begin() != 0) {
     Serial.println(F("Display initialization failed"));

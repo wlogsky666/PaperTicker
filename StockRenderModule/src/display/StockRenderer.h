@@ -1,7 +1,7 @@
 #ifndef STOCK_RENDERER_H
 #define STOCK_RENDERER_H
 
-#include "StockRenderConfig.h"
+#include "../../StockRenderConfig.h"
 #include <Arduino.h>
 #include <limits.h>
 #include <stdlib.h>
